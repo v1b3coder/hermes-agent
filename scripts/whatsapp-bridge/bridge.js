@@ -29,6 +29,7 @@ import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import Database from 'better-sqlite3';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -48,6 +49,7 @@ const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.herme
 const IMAGE_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'image_cache');
 const DOCUMENT_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'document_cache');
 const AUDIO_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
+const MESSAGES_DB = path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'messages.db');
 const PAIR_ONLY = args.includes('--pair-only');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
@@ -63,6 +65,34 @@ const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10
 // fires. Fail fast instead so the gateway can surface a real error and retry.
 const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000', 10);
 
+// ─── Message persistence (SQLite) ─────────────────────────────────────────
+let msgDb;
+try {
+  mkdirSync(path.dirname(MESSAGES_DB), { recursive: true });
+  msgDb = new Database(MESSAGES_DB);
+  msgDb.exec(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      msg_id     TEXT    UNIQUE NOT NULL,
+      chat_id    TEXT    NOT NULL,
+      sender_id  TEXT,
+      sender_name TEXT,
+      chat_name  TEXT,
+      is_group   INTEGER NOT NULL DEFAULT 0,
+      body       TEXT,
+      has_media  INTEGER NOT NULL DEFAULT 0,
+      media_type TEXT,
+      timestamp  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, timestamp);
+  `);
+  console.error('[bridge] Message DB ready:', MESSAGES_DB);
+} catch (err) {
+  console.error('[bridge] Failed to init message DB:', err.message);
+  msgDb = null;
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -122,6 +152,32 @@ function trackSentMessageId(sent) {
 function normalizeWhatsAppId(value) {
   if (!value) return '';
   return String(value).replace(':', '@');
+}
+
+// Lightweight text extraction for group persistence (no media download)
+function extractGroupMessageText(msg) {
+  const content = getMessageContent(msg);
+  if (content.conversation) return content.conversation;
+  if (content.extendedTextMessage?.text) return content.extendedTextMessage.text;
+  if (content.imageMessage?.caption) return content.imageMessage.caption;
+  if (content.videoMessage?.caption) return content.videoMessage.caption;
+  if (content.documentMessage?.caption) return content.documentMessage.caption;
+  // Media without text
+  if (content.imageMessage) return '[image]';
+  if (content.videoMessage) return '[video]';
+  if (content.audioMessage || content.pttMessage) return '[audio]';
+  if (content.documentMessage) return '[document]';
+  return '';
+}
+
+function extractGroupMediaType(msg) {
+  const content = getMessageContent(msg);
+  if (content.imageMessage) return 'image';
+  if (content.videoMessage) return 'video';
+  if (content.audioMessage) return 'audio';
+  if (content.pttMessage) return 'ptt';
+  if (content.documentMessage) return 'document';
+  return '';
 }
 
 function getMessageContent(msg) {
@@ -200,7 +256,7 @@ async function startSocket() {
 
   sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
 
-  sock.ev.on('connection.update', (update) => {
+  sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
@@ -263,6 +319,33 @@ async function startSocket() {
       const senderId = msg.key.participant || chatId;
       const isGroup = chatId.endsWith('@g.us');
       const senderNumber = senderId.replace(/@.*/, '');
+
+      // ── Persist group messages to SQLite (before allowlist filter) ────────
+      // We want to capture ALL group messages, even from people not on the
+      // allowlist, so this runs before the gateway filtering logic below.
+      if (isGroup && msgDb) {
+        try {
+          const grpBody = extractGroupMessageText(msg);
+          const grpMedia = extractGroupMediaType(msg);
+          msgDb.prepare(`
+            INSERT OR IGNORE INTO messages
+              (msg_id, chat_id, sender_id, sender_name, chat_name, is_group, body, has_media, media_type, timestamp)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+          `).run(
+            msg.key.id,
+            chatId,
+            senderId,
+            msg.pushName || senderNumber,
+            null,
+            grpBody,
+            grpMedia ? 1 : 0,
+            grpMedia,
+            msg.messageTimestamp
+          );
+        } catch (err) {
+          console.error('[bridge] DB insert error:', err.message);
+        }
+      }
 
       // Handle fromMe messages based on mode
       if (msg.key.fromMe) {
