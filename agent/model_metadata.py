@@ -20,6 +20,13 @@ from utils import base_url_host_matches, base_url_hostname
 
 from hermes_constants import OPENROUTER_MODELS_URL
 
+# LiteLLM exposes model metadata at ``/v1/model/info`` (not the standard
+# ``/v1/models``).  The response format is:
+#   {"data": [{"model_name": "...", "model_info": {"max_input_tokens": N, ...}}]}
+# Keys honured: ``max_input_tokens``, ``max_tokens``, ``max_output_tokens``
+# (the first found via ``_extract_context_length``'s recursive walk wins).
+_LITELLM_MODEL_INFO_PATH = "/v1/model/info"
+
 logger = logging.getLogger(__name__)
 
 
@@ -67,6 +74,7 @@ _PROVIDER_PREFIXES: frozenset[str] = frozenset({
     "xai", "x-ai", "x.ai", "grok",
     "nvidia", "nim", "nvidia-nim", "nemotron",
     "qwen-portal", "novita-ai", "novitaai",
+    "litellm",
 })
 
 
@@ -634,6 +642,83 @@ def fetch_model_metadata(force_refresh: bool = False) -> Dict[str, Dict[str, Any
     except Exception as e:
         logging.warning(f"Failed to fetch model metadata from OpenRouter: {e}")
         return _model_metadata_cache or {}
+
+
+def _fetch_litellm_model_info(
+    base_url: str,
+    api_key: str,
+    normalized: str,
+    headers: Dict[str, str],
+) -> Dict[str, Dict[str, Any]]:
+    """Fetch model metadata from LiteLLM's ``/v1/model/info`` endpoint.
+
+    LiteLLM exposes this instead of the standard ``/v1/models``.  Response:
+      ``{"data": [{"model_name": "gpt-4", "model_info": {...}}]}``
+    where ``model_info`` may contain ``max_input_tokens`` / ``max_tokens`` /
+    ``max_output_tokens`` and pricing keys.
+    """
+    url = normalized.rstrip("/") + _LITELLM_MODEL_INFO_PATH
+    try:
+        resp = requests.get(url, headers=headers, timeout=10, verify=_resolve_requests_verify())
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as exc:
+        logger.debug("LiteLLM /v1/model/info endpoint failed for %s: %s", normalized, exc)
+        return {}
+
+    cache: Dict[str, Dict[str, Any]] = {}
+    for model in payload.get("data", []):
+        if not isinstance(model, dict):
+            continue
+        model_name = model.get("model_name")
+        if not model_name or not isinstance(model_name, str):
+            continue
+        info = model.get("model_info") or {}
+        if not isinstance(info, dict):
+            info = {}
+        entry: Dict[str, Any] = {"name": model_name}
+        context_length = _extract_context_length(info)
+        if context_length is not None:
+            entry["context_length"] = context_length
+        max_completion_tokens = _extract_max_completion_tokens(info)
+        if max_completion_tokens is not None:
+            entry["max_completion_tokens"] = max_completion_tokens
+        pricing = _extract_pricing(model)
+        if pricing:
+            entry["pricing"] = pricing
+        _add_model_aliases(cache, model_name, entry)
+
+    if cache:
+        logger.info("Resolved %d models from LiteLLM /v1/model/info", len(cache))
+    return cache
+
+
+def _resolve_litellm_context_length(
+    model: str,
+    base_url: str,
+    api_key: str = "",
+) -> Optional[int]:
+    """Resolve context length from LiteLLM's ``/v1/model/info`` endpoint.
+
+    Caches the result on first call.
+    """
+    normalized = _normalize_base_url(base_url)
+    if not normalized:
+        return None
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    metadata = _fetch_litellm_model_info(base_url, api_key, normalized, headers)
+    if not metadata:
+        return None
+    # Exact match first, then substring match
+    entry = metadata.get(model)
+    if entry:
+        return entry.get("context_length")
+    for key, entry in metadata.items():
+        if model in key or key in model:
+            ctx = entry.get("context_length")
+            if isinstance(ctx, int):
+                return ctx
+    return None
 
 
 def fetch_endpoint_model_metadata(
@@ -1643,6 +1728,12 @@ def get_model_context_length(
         # in models.dev yet. Preserve that higher-fidelity endpoint lookup.
         ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
         if ctx is not None:
+            return ctx
+    if effective_provider == "litellm" and base_url:
+        # LiteLLM exposes context_length via /v1/model/info instead of /models.
+        ctx = _resolve_litellm_context_length(model, base_url, api_key=api_key)
+        if ctx is not None:
+            save_context_length(model, base_url, ctx)
             return ctx
     # 5e. Ollama native /api/show probe — runs for ANY provider with a
     # base_url, not just ollama-cloud.  Ollama-compatible servers expose

@@ -1357,7 +1357,7 @@ def resolve_runtime_provider(
             runtime["guardrail_config"] = guardrail_config
         return runtime
 
-    # API-key providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN)
+    # API-key providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN, litellm)
     pconfig = PROVIDER_REGISTRY.get(provider)
     if pconfig and pconfig.auth_type == "api_key":
         creds = resolve_api_key_provider_credentials(provider)
@@ -1370,6 +1370,14 @@ def resolve_runtime_provider(
         if cfg_provider == provider:
             cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
         base_url = cfg_base_url or creds.get("base_url", "").rstrip("/")
+        # Fall back to model_cfg.api_key when env-vars miss and the configured
+        # provider matches — lets users supply the key directly in config.yaml
+        # (e.g. ``api_key: ${SOME_VAR}``) without adding a fixed env-var name.
+        api_key = creds.get("api_key", "")
+        if not api_key and cfg_provider == provider:
+            cfg_key = (model_cfg.get("api_key") or "").strip()
+            if cfg_key:
+                api_key = cfg_key
         api_mode = "chat_completions"
         if provider == "copilot":
             api_mode = _copilot_runtime_api_mode(model_cfg, creds.get("api_key", ""))
@@ -1407,7 +1415,7 @@ def resolve_runtime_provider(
             "provider": provider,
             "api_mode": api_mode,
             "base_url": base_url,
-            "api_key": creds.get("api_key", ""),
+            "api_key": api_key,
             "source": creds.get("source", "env"),
             "requested_provider": requested_provider,
         }

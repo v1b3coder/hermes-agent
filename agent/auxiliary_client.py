@@ -3110,6 +3110,17 @@ def resolve_provider_client(
         # credential is registered for this provider alias.
         if explicit_api_key:
             api_key = explicit_api_key.strip() or api_key
+        # Fall back to model.api_key from config.yaml so providers whose key
+        # comes from the config (e.g. ``api_key: ${CUSTOM_VAR}``) work without
+        # a fixed env-var name registered in the provider profile.
+        if not api_key:
+            try:
+                from hermes_cli.config import load_config as _lc
+                _mc = _lc().get("model", {})
+                if isinstance(_mc, dict) and str(_mc.get("provider", "")).strip().lower() == provider:
+                    api_key = str(_mc.get("api_key", "") or "").strip()
+            except Exception:
+                pass
         if not api_key:
             tried_sources = list(pconfig.api_key_env_vars)
             if provider == "copilot":
