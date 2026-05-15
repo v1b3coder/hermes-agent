@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import random
+import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone
@@ -25,6 +26,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote
 
 import httpx
+
+
+def _signal_db_path() -> str:
+    """Return the path to the Signal message SQLite DB."""
+    home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+    return os.path.join(home, "signal", "messages.db")
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -237,6 +244,34 @@ class SignalAdapter(BasePlatformAdapter):
         logger.info("Signal adapter initialized: url=%s account=%s groups=%s",
                      self.http_url, redact_phone(self.account),
                      "enabled" if self.group_allow_from else "disabled")
+
+        # ── Message persistence (SQLite) ────────────────────────────────────
+        db_path = _signal_db_path()
+        try:
+            os.makedirs(os.path.dirname(db_path), exist_ok=True)
+            conn = sqlite3.connect(db_path)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    msg_id      TEXT    UNIQUE NOT NULL,
+                    group_id    TEXT    NOT NULL,
+                    group_name  TEXT,
+                    sender_id   TEXT,
+                    sender_name TEXT,
+                    body        TEXT,
+                    has_media   INTEGER NOT NULL DEFAULT 0,
+                    media_type  TEXT,
+                    timestamp   INTEGER NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_msg_group_ts ON messages(group_id, timestamp)")
+            conn.commit()
+            conn.close()
+            logger.info("Signal: message DB ready: %s", db_path)
+        except Exception as e:
+            logger.warning("Signal: failed to init message DB: %s", e)
+            db_path = None
+        self._msg_db_path = db_path
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -495,6 +530,22 @@ class SignalAdapter(BasePlatformAdapter):
         group_id = group_info.get("groupId") if group_info else None
         is_group = bool(group_id)
 
+        # Persist ALL group messages to SQLite — before allowlist filter, so all
+        # members are recorded even if the group is not in SIGNAL_GROUP_ALLOWED_USERS.
+        # Needed for signal-reader skill to observe groups on read-only basis.
+        if is_group and self._msg_db_path:
+            self._persist_group_message(
+                msg_id=str(envelope_data.get("timestamp", "")),
+                group_id=group_id,
+                group_name=group_info.get("groupName") or "",
+                sender_id=sender or "",
+                sender_name=sender_name or sender or "",
+                body="",
+                has_media=0,
+                media_type=None,
+                timestamp=int(envelope_data.get("timestamp", 0) // 1000),
+            )
+
         # Group message filtering — derived from SIGNAL_GROUP_ALLOWED_USERS:
         # - No env var set → groups disabled (default safe behavior)
         # - Env var set with group IDs → only those groups allowed
@@ -614,6 +665,36 @@ class SignalAdapter(BasePlatformAdapter):
             return
         self._recipient_uuid_by_number[number] = service_id
         self._recipient_number_by_uuid[service_id] = number
+
+    def _persist_group_message(
+        self,
+        msg_id: str,
+        group_id: str,
+        group_name: str,
+        sender_id: str,
+        sender_name: str,
+        body: str,
+        has_media: int,
+        media_type: Optional[str],
+        timestamp: int,
+    ) -> None:
+        """Persist a group message to SQLite (best-effort, non-blocking)."""
+        if not self._msg_db_path:
+            return
+        try:
+            conn = sqlite3.connect(self._msg_db_path)
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO messages
+                    (msg_id, group_id, group_name, sender_id, sender_name, body, has_media, media_type, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (msg_id, group_id, group_name, sender_id, sender_name, body, has_media, media_type, timestamp),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.debug("Signal: failed to persist message: %s", e)
 
     def _extract_contact_uuid(self, contact: Any, phone_number: str) -> Optional[str]:
         """Best-effort extraction of a Signal service ID from listContacts output."""
