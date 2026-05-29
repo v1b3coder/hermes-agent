@@ -19,10 +19,12 @@ class CustomProfile(ProviderProfile):
         self,
         *,
         reasoning_config: dict | None = None,
+        supports_reasoning: bool = False,
         ollama_num_ctx: int | None = None,
         **ctx: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         extra_body: dict[str, Any] = {}
+        top_level: dict[str, Any] = {}
 
         # Ollama context window
         if ollama_num_ctx:
@@ -36,8 +38,13 @@ class CustomProfile(ProviderProfile):
             _enabled = reasoning_config.get("enabled", True)
             if _effort == "none" or _enabled is False:
                 extra_body["think"] = False
+            else:
+                # Send reasoning_effort as top-level API kwarg (OpenAI-compat).
+                # Custom endpoints like vLLM expect `reasoning_effort` directly
+                # on the request body, not nested in extra_body.
+                top_level["reasoning_effort"] = _effort
 
-        return extra_body, {}
+        return extra_body, top_level
 
     def fetch_models(
         self,
